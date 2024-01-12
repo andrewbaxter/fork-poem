@@ -1,79 +1,39 @@
-use std::{
-    fmt::{
-        self,
-        Display,
-        Formatter,
+use crate::{
+    listener::{
+        acme::{
+            client::{get_nonce, AcmeClient},
+            jose,
+            protocol::NewAccountRequest,
+            resolver::{ResolveServerCert, ACME_TLS_ALPN_NAME},
+            AutoCert, ChallengeType, Http01TokensMap,
+        },
+        Acceptor, HandshakeStream, Listener,
     },
-    io::{
-        Error as IoError,
-        ErrorKind,
-        Result as IoResult,
-    },
-    sync::{
-        Arc,
-        Weak,
-    },
-    time::{
-        Duration,
-        UNIX_EPOCH,
-    },
+    web::{LocalAddr, RemoteAddr},
 };
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::uri::Scheme;
-use jsonwebtoken::{
-    jwk::Jwk,
-    EncodingKey,
-    Header,
-};
+use jsonwebtoken::{jwk::Jwk, EncodingKey, Header};
 use rcgen::{
-    Certificate,
-    CertificateParams,
-    CustomExtension,
-    DistinguishedName,
-    PKCS_ECDSA_P256_SHA256,
+    Certificate, CertificateParams, CustomExtension, DistinguishedName, PKCS_ECDSA_P256_SHA256,
+};
+use std::{
+    fmt::{self, Display, Formatter},
+    io::{Error as IoError, ErrorKind, Result as IoResult},
+    sync::{Arc, Weak},
+    time::{Duration, UNIX_EPOCH},
 };
 use tokio_rustls::{
     rustls::{
         crypto::ring::sign::any_ecdsa_type,
-        pki_types::{
-            CertificateDer,
-            PrivateKeyDer,
-        },
+        pki_types::{CertificateDer, PrivateKeyDer},
         sign::CertifiedKey,
         ServerConfig,
     },
     server::TlsStream,
     TlsAcceptor,
 };
-use x509_parser::prelude::{
-    FromDer,
-    X509Certificate,
-};
-use crate::{
-    listener::{
-        acme::{
-            client::{
-                get_nonce,
-                AcmeClient,
-            },
-            jose,
-            protocol::NewAccountRequest,
-            resolver::{
-                ResolveServerCert,
-                ACME_TLS_ALPN_NAME,
-            },
-            AutoCert,
-            ChallengeType,
-            Http01TokensMap,
-        },
-        Acceptor,
-        HandshakeStream,
-        Listener,
-    },
-    web::{
-        LocalAddr,
-        RemoteAddr,
-    },
-};
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 pub(crate) async fn auto_cert_acceptor<T: Listener>(
     base_listener: T,
@@ -144,9 +104,16 @@ impl<T: Listener> Listener for AutoCertListener<T> {
     type Acceptor = AutoCertAcceptor<T::Acceptor>;
 
     async fn into_acceptor(self) -> IoResult<Self::Acceptor> {
-        let mut client = AcmeClient::try_new(&self.auto_cert.directory_url, self.auto_cert.contacts.clone()).await?;
+        let mut client = AcmeClient::try_new(
+            &self.auto_cert.directory_url,
+            self.auto_cert.contacts.clone(),
+        )
+        .await?;
         let cert_resolver = Arc::new(ResolveServerCert::default());
-        if let (Some(certs), Some(key)) = (self.auto_cert.cache_cert.as_ref(), self.auto_cert.cache_key.as_ref()) {
+        if let (Some(certs), Some(key)) = (
+            self.auto_cert.cache_cert.as_ref(),
+            self.auto_cert.cache_key.as_ref(),
+        ) {
             *cert_resolver.cert.write() = load_certified_key(&certs, &key);
         }
 
@@ -162,29 +129,39 @@ impl<T: Listener> Listener for AutoCertListener<T> {
                     Ok(k) => {
                         kid = k;
                         break;
-                    },
+                    }
                     Err(err) => {
                         tracing::error!(error =% err, "failed to create acme account");
                         tokio::time::sleep(Duration::from_secs(60 * 5)).await;
-                    },
+                    }
                 }
             }
             while let Some(cert_resolver) = Weak::upgrade(&weak_cert_resolver) {
                 if cert_resolver.is_expired() {
                     match async {
-                        let res = issue_cert(&mut client, &kid, &domains, match challenge_type {
-                            ChallengeType::Http01 => ChallengeTypeParameters::Http01 {
-                                keys_for_http01: keys_for_http01.as_ref().unwrap(),
+                        let res = issue_cert(
+                            &mut client,
+                            &kid,
+                            &domains,
+                            match challenge_type {
+                                ChallengeType::Http01 => ChallengeTypeParameters::Http01 {
+                                    keys_for_http01: keys_for_http01.as_ref().unwrap(),
+                                },
+                                ChallengeType::TlsAlpn01 => ChallengeTypeParameters::TlsAlpn01 {
+                                    resolver: &cert_resolver,
+                                },
                             },
-                            ChallengeType::TlsAlpn01 => ChallengeTypeParameters::TlsAlpn01 {
-                                resolver: &cert_resolver,
-                            },
-                        }).await.map_err(|err| {
+                        )
+                        .await
+                        .map_err(|err| {
                             IoError::new(ErrorKind::Other, format!("error issuing cert: {err}"))
                         })?;
                         let key = load_certified_key(&res.public_pem, &res.private_pem).unwrap();
-                        return Ok((res, key)) as Result<(IssueCertResult, Arc<CertifiedKey>), IoError>;
-                    }.await {
+                        return Ok((res, key))
+                            as Result<(IssueCertResult, Arc<CertifiedKey>), IoError>;
+                    }
+                    .await
+                    {
                         Ok((res, key)) => {
                             *cert_resolver.cert.write() = Some(key);
                             if let Some(cache_path) = &cache_path {
@@ -302,44 +279,67 @@ pub async fn create_acme_account(
 ) -> IoResult<String> {
     tracing::debug!("creating acme account");
     let nonce = get_nonce(&client.client, &client.directory).await?;
-    let jwk =
-        Jwk::from_encoding_key(
-            &client.key_pair,
-            JWK_ALG,
-        ).map_err(|err| IoError::new(ErrorKind::Other, format!("failed to generate JWK: {err}")))?;
-    let resp = jose::request(&client.client, &client.directory.new_account, &jsonwebtoken::encode_jws(&Header {
-        alg: JWK_ALG,
-        jwk: Some(jwk.clone()),
-        nonce: Some(nonce),
-        url: Some(client.directory.new_account.clone()),
-        ..Default::default()
-    }, Some(&NewAccountRequest {
-        only_return_existing: false,
-        terms_of_service_agreed: true,
-        contacts: client.contacts.clone(),
-        external_account_binding: match external_account_binding {
-            Some(eab) => Some(jsonwebtoken::encode_jws(&Header {
-                alg: jsonwebtoken::Algorithm::HS256,
-                kid: Some(eab.kid.clone()),
+    let jwk = Jwk::from_encoding_key(&client.key_pair, JWK_ALG)
+        .map_err(|err| IoError::new(ErrorKind::Other, format!("failed to generate JWK: {err}")))?;
+    let resp = jose::request(
+        &client.client,
+        &client.directory.new_account,
+        &jsonwebtoken::encode_jws(
+            &Header {
+                alg: JWK_ALG,
+                jwk: Some(jwk.clone()),
+                nonce: Some(nonce),
                 url: Some(client.directory.new_account.clone()),
                 ..Default::default()
-            }, Some(&jwk), &EncodingKey::from_urlsafe_base64_secret(&eab.hmac_b64).map_err(|err| {
-                IoError::new(ErrorKind::Other, format!("failed to decode hmac secret: {err}"))
-            })?).map_err(|err| {
-                IoError::new(ErrorKind::Other, format!("error producing external account binding JWS: {err}"))
-            })?),
-            None => None,
-        },
-    }), &client.key_pair).map_err(|err| {
-        IoError::new(ErrorKind::Other, format!("failed to encode payload: {err}"))
-    })?).await?;
-    let kid =
-        resp
-            .headers()
-            .get("location")
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string)
-            .ok_or_else(|| IoError::new(ErrorKind::Other, "unable to get account id"))?;
+            },
+            Some(&NewAccountRequest {
+                only_return_existing: false,
+                terms_of_service_agreed: true,
+                contacts: client.contacts.clone(),
+                external_account_binding: match external_account_binding {
+                    Some(eab) => Some(
+                        jsonwebtoken::encode_jws(
+                            &Header {
+                                alg: jsonwebtoken::Algorithm::HS256,
+                                kid: Some(eab.kid.clone()),
+                                url: Some(client.directory.new_account.clone()),
+                                ..Default::default()
+                            },
+                            Some(&jwk),
+                            &EncodingKey::from_secret(
+                                &base64::Engine::decode(&URL_SAFE_NO_PAD, &eab.hmac_b64).map_err(
+                                    |err| {
+                                        IoError::new(
+                                            ErrorKind::Other,
+                                            format!("failed to decode hmac secret: {err}"),
+                                        )
+                                    },
+                                )?,
+                            ),
+                        )
+                        .map_err(|err| {
+                            IoError::new(
+                                ErrorKind::Other,
+                                format!("error producing external account binding JWS: {err}"),
+                            )
+                        })?,
+                    ),
+                    None => None,
+                },
+            }),
+            &client.key_pair,
+        )
+        .map_err(|err| {
+            IoError::new(ErrorKind::Other, format!("failed to encode payload: {err}"))
+        })?,
+    )
+    .await?;
+    let kid = resp
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+        .ok_or_else(|| IoError::new(ErrorKind::Other, "unable to get account id"))?;
     tracing::debug!(kid = kid.as_str(), "account created");
     Ok(kid)
 }
@@ -361,37 +361,49 @@ pub async fn issue_cert<T: AsRef<str>>(
     challenge_type: ChallengeTypeParameters<'_>,
 ) -> IoResult<IssueCertResult> {
     tracing::debug!("issue certificate");
-    let jwk =
-        Jwk::from_encoding_key(
-            &client.key_pair,
-            JWK_ALG,
-        ).map_err(|err| IoError::new(ErrorKind::Other, format!("failed to generate JWK: {err}")))?;
+    let jwk = Jwk::from_encoding_key(&client.key_pair, JWK_ALG)
+        .map_err(|err| IoError::new(ErrorKind::Other, format!("failed to generate JWK: {err}")))?;
     let order_resp = client.new_order(domains, kid).await?;
 
     // trigger challenge
     let mut valid = false;
-    for i in 1 .. 5 {
+
+    for i in 1..5 {
         let mut all_valid = true;
+
         for auth_url in &order_resp.authorizations {
             let resp = client.fetch_authorization(auth_url, kid).await?;
             if resp.status == "valid" {
                 continue;
             }
+
             all_valid = false;
+
             if resp.status == "pending" {
                 let challenge = resp.find_challenge(&challenge_type)?;
                 match &challenge_type {
                     ChallengeTypeParameters::Http01 { keys_for_http01 } => {
                         let key_authorization = jose::key_authorization(&jwk, &challenge.token)?;
                         keys_for_http01.insert(challenge.token.to_string(), key_authorization);
-                    },
+                    }
                     ChallengeTypeParameters::TlsAlpn01 { resolver } => {
-                        let key_authorization_sha256 = jose::key_authorization_sha256(&jwk, &challenge.token)?;
-                        let auth_key = gen_acme_cert(&resp.identifier.value, key_authorization_sha256.as_ref())?;
-                        resolver.acme_keys.write().insert(resp.identifier.value.to_string(), Arc::new(auth_key));
-                    },
+                        let key_authorization_sha256 =
+                            jose::key_authorization_sha256(&jwk, &challenge.token)?;
+                        let auth_key = gen_acme_cert(
+                            &resp.identifier.value,
+                            key_authorization_sha256.as_ref(),
+                        )?;
+
+                        resolver
+                            .acme_keys
+                            .write()
+                            .insert(resp.identifier.value.to_string(), Arc::new(auth_key));
+                    }
                 }
-                client.trigger_challenge(&resp.identifier.value, &challenge_type, &challenge.url, kid).await?;
+
+                client
+                    .trigger_challenge(&resp.identifier.value, &challenge_type, &challenge.url, kid)
+                    .await?;
             } else if resp.status == "invalid" {
                 return Err(IoError::new(
                     ErrorKind::Other,
@@ -423,8 +435,12 @@ pub async fn issue_cert<T: AsRef<str>>(
     }
 
     // send csr
-    let mut params =
-        CertificateParams::new(domains.iter().map(|domain| domain.as_ref().to_string()).collect::<Vec<_>>());
+    let mut params = CertificateParams::new(
+        domains
+            .iter()
+            .map(|domain| domain.as_ref().to_string())
+            .collect::<Vec<_>>(),
+    );
     params.distinguished_name = DistinguishedName::new();
     params.alg = &PKCS_ECDSA_P256_SHA256;
     let cert = Certificate::from_params(params).map_err(|err| {
@@ -467,9 +483,17 @@ pub async fn issue_cert<T: AsRef<str>>(
     }
 
     // download certificate
-    let acme_cert_pem = client.obtain_certificate(order_resp.certificate.as_ref().ok_or_else(|| {
-        IoError::new(ErrorKind::Other, "invalid response: missing `certificate` url")
-    })?, kid).await?;
+    let acme_cert_pem = client
+        .obtain_certificate(
+            order_resp.certificate.as_ref().ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::Other,
+                    "invalid response: missing `certificate` url",
+                )
+            })?,
+            kid,
+        )
+        .await?;
     let pkey_pem = cert.serialize_private_key_pem();
     tracing::debug!("certificate obtained");
 
@@ -489,30 +513,39 @@ pub fn load_certified_key(mut pub_pem: &[u8], mut priv_pem: &[u8]) -> Option<Arc
         Err(err) => {
             tracing::warn!("failed to parse cached tls certificates: {}", err);
             return None;
-        },
+        }
     };
     match rustls_pemfile::pkcs8_private_keys(&mut priv_pem).map(|k| k.into_iter().next()) {
         Ok(k) => match k {
             Some(k) => key = k,
             None => {
                 return None;
-            },
+            }
         },
         Err(err) => {
             tracing::warn!("failed to parse cached private key: {}", err);
             return None;
-        },
+        }
     };
-    let certs = certs.into_iter().map(CertificateDer::from).collect::<Vec<_>>();
-    let expires_at =
-        match certs
-            .first()
-            .and_then(|cert| X509Certificate::from_der(cert.as_ref()).ok())
-            .map(|(_, cert)| cert.validity().not_after.timestamp())
-            .map(|timestamp| UNIX_EPOCH + Duration::from_secs(timestamp as u64)) {
-            Some(expires_at) => chrono::DateTime::<chrono::Utc>::from(expires_at).to_string(),
-            None => "unknown".to_string(),
-        };
-    tracing::debug!(expires_at = expires_at.as_str(), "using cached tls certificates");
-    return Some(Arc::new(CertifiedKey::new(certs, any_ecdsa_type(&PrivateKeyDer::Pkcs8(key.into())).unwrap())));
+    let certs = certs
+        .into_iter()
+        .map(CertificateDer::from)
+        .collect::<Vec<_>>();
+    let expires_at = match certs
+        .first()
+        .and_then(|cert| X509Certificate::from_der(cert.as_ref()).ok())
+        .map(|(_, cert)| cert.validity().not_after.timestamp())
+        .map(|timestamp| UNIX_EPOCH + Duration::from_secs(timestamp as u64))
+    {
+        Some(expires_at) => chrono::DateTime::<chrono::Utc>::from(expires_at).to_string(),
+        None => "unknown".to_string(),
+    };
+    tracing::debug!(
+        expires_at = expires_at.as_str(),
+        "using cached tls certificates"
+    );
+    return Some(Arc::new(CertifiedKey::new(
+        certs,
+        any_ecdsa_type(&PrivateKeyDer::Pkcs8(key.into())).unwrap(),
+    )));
 }
