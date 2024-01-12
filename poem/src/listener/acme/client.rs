@@ -1,28 +1,26 @@
-use std::{
-    io::{Error as IoError, ErrorKind, Result as IoResult},
-    sync::Arc,
-};
+use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use jsonwebtoken::{EncodingKey, Header};
 use reqwest::Client;
+use ring::{rand::SystemRandom, signature::EcdsaKeyPair};
 
+use super::{listener::ChallengeTypeParameters, ACME_KEY_ALG};
 use crate::listener::acme::{
     jose,
-    keypair::KeyPair,
     protocol::{
-        CsrRequest, Directory, FetchAuthorizationResponse, Identifier, NewAccountRequest,
-        NewOrderRequest, NewOrderResponse,
+        CsrRequest, Directory, FetchAuthorizationResponse, Identifier, NewOrderRequest,
+        NewOrderResponse,
     },
-    ChallengeType,
 };
+/// The result of [`issue_cert`] function.
 
 /// A client for ACME-supporting TLS certificate services.
 pub struct AcmeClient {
-    client: Client,
-    directory: Directory,
-    pub(crate) key_pair: Arc<KeyPair>,
-    contacts: Vec<String>,
-    kid: Option<String>,
+    pub(crate) client: Client,
+    pub(crate) directory: Directory,
+    pub(crate) key_pair: EncodingKey,
+    pub(crate) contacts: Vec<String>,
 }
 
 impl AcmeClient {
@@ -31,53 +29,64 @@ impl AcmeClient {
     pub async fn try_new(directory_url: &str, contacts: Vec<String>) -> IoResult<Self> {
         let client = Client::new();
         let directory = get_directory(&client, directory_url).await?;
+        let rng = SystemRandom::new();
+        let key_pair = EcdsaKeyPair::generate_pkcs8(ACME_KEY_ALG, &rng)
+            .map_err(|_| IoError::new(ErrorKind::Other, "failed to generate acme key pair"))?;
         Ok(Self {
             client,
             directory,
-            key_pair: Arc::new(KeyPair::generate()?),
+            key_pair: EncodingKey::from_ec_der(key_pair.as_ref()),
             contacts,
-            kid: None,
         })
     }
 
+    /// Similar to `try_new` but uses a provided key instead of generating a new one.
+    pub async fn try_new_with_key(
+        directory_url: &str,
+        contacts: Vec<String>,
+        key: EncodingKey,
+    ) -> IoResult<Self> {
+        let client = Client::new();
+        let directory = get_directory(&client, directory_url).await?;
+        Ok(Self {
+            client,
+            directory,
+            key_pair: key,
+            contacts,
+        })
+    }
     pub(crate) async fn new_order<T: AsRef<str>>(
         &mut self,
         domains: &[T],
+        kid: &str,
     ) -> IoResult<NewOrderResponse> {
-        let kid = match &self.kid {
-            Some(kid) => kid,
-            None => {
-                // create account
-                let kid = create_acme_account(
-                    &self.client,
-                    &self.directory,
-                    &self.key_pair,
-                    self.contacts.clone(),
-                )
-                .await?;
-                self.kid = Some(kid);
-                self.kid.as_ref().unwrap()
-            }
-        };
-
-        tracing::debug!(kid = kid.as_str(), "new order request");
+        tracing::debug!(kid = kid, "new order request");
 
         let nonce = get_nonce(&self.client, &self.directory).await?;
         let resp: NewOrderResponse = jose::request_json(
             &self.client,
-            &self.key_pair,
-            Some(kid),
-            &nonce,
             &self.directory.new_order,
-            Some(NewOrderRequest {
-                identifiers: domains
-                    .iter()
-                    .map(|domain| Identifier {
-                        ty: "dns".to_string(),
-                        value: domain.as_ref().to_string(),
-                    })
-                    .collect(),
-            }),
+            &jsonwebtoken::encode_jws(
+                &Header {
+                    kid: Some(kid.to_string()),
+                    nonce: Some(nonce),
+                    url: Some(self.directory.new_order.clone()),
+                    ..Default::default()
+                },
+                Some(&NewOrderRequest {
+                    identifiers: domains
+                        .iter()
+                        .map(|domain| Identifier {
+                            ty: "dns".to_string(),
+                            value: domain.as_ref().to_string(),
+                        })
+                        .collect(),
+                }),
+                &self.key_pair,
+            )
+            .map_err(|err| {
+                IoError::new(ErrorKind::Other, format!("failed to encode payload: {err}"))
+            })?,
         )
         .await?;
 
@@ -88,17 +97,27 @@ impl AcmeClient {
     pub(crate) async fn fetch_authorization(
         &self,
         auth_url: &str,
+        kid: &str,
     ) -> IoResult<FetchAuthorizationResponse> {
         tracing::debug!(auth_uri = %auth_url, "fetch authorization");
 
         let nonce = get_nonce(&self.client, &self.directory).await?;
         let resp: FetchAuthorizationResponse = jose::request_json(
             &self.client,
-            &self.key_pair,
-            self.kid.as_deref(),
-            &nonce,
             auth_url,
-            None::<()>,
+            &jsonwebtoken::encode_jws(
+                &Header {
+                    kid: Some(kid.to_string()),
+                    nonce: Some(nonce),
+                    url: Some(auth_url.to_string()),
+                    ..Default::default()
+                },
+                None::<&()>,
+                &self.key_pair,
+            )
+            .map_err(|err| {
+                IoError::new(ErrorKind::Other, format!("failed to encode payload: {err}"))
+            })?,
         )
         .await?;
 
@@ -114,8 +133,9 @@ impl AcmeClient {
     pub(crate) async fn trigger_challenge(
         &self,
         domain: &str,
-        challenge_type: ChallengeType,
+        challenge_type: &ChallengeTypeParameters<'_>,
         url: &str,
+        kid: &str,
     ) -> IoResult<()> {
         tracing::debug!(
             auth_uri = %url,
@@ -127,45 +147,77 @@ impl AcmeClient {
         let nonce = get_nonce(&self.client, &self.directory).await?;
         jose::request(
             &self.client,
-            &self.key_pair,
-            self.kid.as_deref(),
-            &nonce,
             url,
-            Some(serde_json::json!({})),
+            &jsonwebtoken::encode_jws(
+                &Header {
+                    kid: Some(kid.to_string()),
+                    nonce: Some(nonce),
+                    url: Some(url.to_string()),
+                    ..Default::default()
+                },
+                Some(&serde_json::json!({})),
+                &self.key_pair,
+            )
+            .map_err(|err| {
+                IoError::new(ErrorKind::Other, format!("failed to encode payload: {err}"))
+            })?,
         )
         .await?;
 
         Ok(())
     }
 
-    pub(crate) async fn send_csr(&self, url: &str, csr: &[u8]) -> IoResult<NewOrderResponse> {
+    pub(crate) async fn send_csr(
+        &self,
+        url: &str,
+        kid: &str,
+        csr: &[u8],
+    ) -> IoResult<NewOrderResponse> {
         tracing::debug!(url = %url, "send certificate request");
 
         let nonce = get_nonce(&self.client, &self.directory).await?;
         jose::request_json(
             &self.client,
-            &self.key_pair,
-            self.kid.as_deref(),
-            &nonce,
             url,
-            Some(CsrRequest {
-                csr: URL_SAFE_NO_PAD.encode(csr),
-            }),
+            &jsonwebtoken::encode_jws(
+                &Header {
+                    kid: Some(kid.to_string()),
+                    nonce: Some(nonce),
+                    url: Some(url.to_string()),
+                    ..Default::default()
+                },
+                Some(&CsrRequest {
+                    csr: URL_SAFE_NO_PAD.encode(csr),
+                }),
+                &self.key_pair,
+            )
+            .map_err(|err| {
+                IoError::new(ErrorKind::Other, format!("failed to encode payload: {err}"))
+            })?,
         )
         .await
     }
 
-    pub(crate) async fn obtain_certificate(&self, url: &str) -> IoResult<Vec<u8>> {
+    pub(crate) async fn obtain_certificate(&self, url: &str, kid: &str) -> IoResult<Vec<u8>> {
         tracing::debug!(url = %url, "send certificate request");
 
         let nonce = get_nonce(&self.client, &self.directory).await?;
         let resp = jose::request(
             &self.client,
-            &self.key_pair,
-            self.kid.as_deref(),
-            &nonce,
             url,
-            None::<()>,
+            &jsonwebtoken::encode_jws(
+                &Header {
+                    kid: Some(kid.to_string()),
+                    nonce: Some(nonce),
+                    url: Some(url.to_string()),
+                    ..Default::default()
+                },
+                None::<&()>,
+                &self.key_pair,
+            )
+            .map_err(|err| {
+                IoError::new(ErrorKind::Other, format!("failed to encode payload: {err}"))
+            })?,
         )
         .await?;
 
@@ -209,7 +261,7 @@ async fn get_directory(client: &Client, directory_url: &str) -> IoResult<Directo
     Ok(directory)
 }
 
-async fn get_nonce(client: &Client, directory: &Directory) -> IoResult<String> {
+pub(crate) async fn get_nonce(client: &Client, directory: &Directory) -> IoResult<String> {
     tracing::debug!("creating nonce");
 
     let resp = client
@@ -234,37 +286,4 @@ async fn get_nonce(client: &Client, directory: &Directory) -> IoResult<String> {
 
     tracing::debug!(nonce = nonce.as_str(), "nonce created");
     Ok(nonce)
-}
-
-async fn create_acme_account(
-    client: &Client,
-    directory: &Directory,
-    key_pair: &KeyPair,
-    contacts: Vec<String>,
-) -> IoResult<String> {
-    tracing::debug!("creating acme account");
-
-    let nonce = get_nonce(client, directory).await?;
-    let resp = jose::request(
-        client,
-        key_pair,
-        None,
-        &nonce,
-        &directory.new_account,
-        Some(NewAccountRequest {
-            only_return_existing: false,
-            terms_of_service_agreed: true,
-            contacts,
-        }),
-    )
-    .await?;
-    let kid = resp
-        .headers()
-        .get("location")
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string)
-        .ok_or_else(|| IoError::new(ErrorKind::Other, "unable to get account id"))?;
-
-    tracing::debug!(kid = kid.as_str(), "account created");
-    Ok(kid)
 }

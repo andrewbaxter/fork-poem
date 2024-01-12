@@ -1,15 +1,9 @@
-use std::{
-    fmt::{self, Display, Formatter},
-    io::{Error as IoError, ErrorKind, Result as IoResult},
-};
+use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 
+use jsonwebtoken::{jwk::Jwk, jws::Jws};
 use serde::{Deserialize, Serialize};
 
-/// HTTP-01 challenge
-const CHALLENGE_TYPE_HTTP_01: &str = "http-01";
-
-/// TLS-ALPN-01 challenge
-const CHALLENGE_TYPE_TLS_ALPN_01: &str = "tls-alpn-01";
+use super::listener::ChallengeTypeParameters;
 
 /// Challenge type
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -22,15 +16,6 @@ pub enum ChallengeType {
     ///
     /// Reference: <https://letsencrypt.org/docs/challenge-types/#tls-alpn-01>
     TlsAlpn01,
-}
-
-impl Display for ChallengeType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            ChallengeType::Http01 => f.write_str(CHALLENGE_TYPE_HTTP_01),
-            ChallengeType::TlsAlpn01 => f.write_str(CHALLENGE_TYPE_TLS_ALPN_01),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +32,8 @@ pub(crate) struct NewAccountRequest {
     pub(crate) only_return_existing: bool,
     pub(crate) terms_of_service_agreed: bool,
     pub(crate) contacts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) external_account_binding: Option<Jws<Jwk>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -97,13 +84,11 @@ pub(crate) struct FetchAuthorizationResponse {
 }
 
 impl FetchAuthorizationResponse {
-    pub(crate) fn find_challenge(&self, ty: ChallengeType) -> IoResult<&Challenge> {
-        self.challenges
-            .iter()
-            .find(|c| c.ty == ty.to_string())
-            .ok_or_else(|| {
-                IoError::new(ErrorKind::Other, format!("unable to find `{ty}` challenge"))
-            })
+    pub(crate) fn find_challenge(&self, ty: &ChallengeTypeParameters<'_>) -> IoResult<&Challenge> {
+        let ty = ty.to_string();
+        self.challenges.iter().find(|c| c.ty == ty).ok_or_else(|| {
+            IoError::new(ErrorKind::Other, format!("unable to find `{ty}` challenge"))
+        })
     }
 }
 
