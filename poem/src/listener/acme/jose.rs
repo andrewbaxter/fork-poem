@@ -1,10 +1,20 @@
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use jsonwebtoken::{jwk::Jwk, jws::Jws};
+use jsonwebtoken::{jwk::Jwk, jws::Jws, Header};
 use reqwest::{Client, Response};
 use ring::digest::{digest, Digest, SHA256};
 use serde::{de::DeserializeOwned, Serialize};
+
+pub(crate) fn header(kid: &str, nonce: String, url: &str) -> Header {
+    Header {
+        alg: jsonwebtoken::Algorithm::ES256,
+        kid: Some(kid.to_string()),
+        url: Some(url.to_string()),
+        nonce: Some(nonce),
+        ..Default::default()
+    }
+}
 
 pub(crate) async fn request<T>(cli: &Client, url: &str, jws: &Jws<T>) -> IoResult<Response>
 where
@@ -26,9 +36,20 @@ where
         })?;
 
     if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.bytes().await.map_err(|err| {
+            IoError::new(
+                ErrorKind::Other,
+                format!("failed to read response body: {err}"),
+            )
+        })?;
         return Err(IoError::new(
             ErrorKind::Other,
-            format!("unexpected status code: status = {}", resp.status()),
+            format!(
+                "unexpected status code: status = {}\nbody: {}",
+                status,
+                String::from_utf8_lossy(&body)
+            ),
         ));
     }
     Ok(resp)

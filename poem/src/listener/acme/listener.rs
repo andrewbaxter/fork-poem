@@ -363,7 +363,12 @@ pub async fn issue_cert<T: AsRef<str>>(
     tracing::debug!("issue certificate");
     let jwk = Jwk::from_encoding_key(&client.key_pair, JWK_ALG)
         .map_err(|err| IoError::new(ErrorKind::Other, format!("failed to generate JWK: {err}")))?;
-    let order_resp = client.new_order(domains, kid).await?;
+    let order_resp = client.new_order(domains, kid).await.map_err(|err| {
+        IoError::new(
+            ErrorKind::Other,
+            format!("failed to initiate new order: {err}"),
+        )
+    })?;
 
     // trigger challenge
     let mut valid = false;
@@ -372,7 +377,15 @@ pub async fn issue_cert<T: AsRef<str>>(
         let mut all_valid = true;
 
         for auth_url in &order_resp.authorizations {
-            let resp = client.fetch_authorization(auth_url, kid).await?;
+            let resp = client
+                .fetch_authorization(auth_url, kid)
+                .await
+                .map_err(|err| {
+                    IoError::new(
+                        ErrorKind::Other,
+                        format!("failed to fetch authorization {auth_url}: {err}"),
+                    )
+                })?;
             if resp.status == "valid" {
                 continue;
             }
@@ -403,7 +416,15 @@ pub async fn issue_cert<T: AsRef<str>>(
 
                 client
                     .trigger_challenge(&resp.identifier.value, &challenge_type, &challenge.url, kid)
-                    .await?;
+                    .await
+                    .map_err(|err| {
+                        IoError::new(
+                            ErrorKind::Other,
+                            format!(
+                                "error triggering challenge for authorization {auth_url}: {err}"
+                            ),
+                        )
+                    })?;
             } else if resp.status == "invalid" {
                 return Err(IoError::new(
                     ErrorKind::Other,
@@ -456,7 +477,15 @@ pub async fn issue_cert<T: AsRef<str>>(
         )
     })?;
 
-    let order_resp = client.send_csr(&order_resp.finalize, &csr).await?;
+    let order_resp = client
+        .send_csr(&order_resp.finalize, kid, &csr)
+        .await
+        .map_err(|err| {
+            IoError::new(
+                ErrorKind::Other,
+                format!("error sending csr to issuer: {err}"),
+            )
+        })?;
 
     if order_resp.status == "invalid" {
         return Err(IoError::new(
@@ -485,12 +514,21 @@ pub async fn issue_cert<T: AsRef<str>>(
     // download certificate
     let acme_cert_pem = client
         .obtain_certificate(
-            order_resp.certificate.as_ref().ok_or_else(|| {
-                IoError::new(
-                    ErrorKind::Other,
-                    "invalid response: missing `certificate` url",
-                )
-            })?,
+            order_resp
+                .certificate
+                .as_ref()
+                .ok_or_else(|| {
+                    IoError::new(
+                        ErrorKind::Other,
+                        "invalid response: missing `certificate` url",
+                    )
+                })
+                .map_err(|err| {
+                    IoError::new(
+                        ErrorKind::Other,
+                        format!("error downloading certificate: {err}"),
+                    )
+                })?,
             kid,
         )
         .await?;

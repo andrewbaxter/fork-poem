@@ -1,13 +1,13 @@
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use jsonwebtoken::{EncodingKey, Header};
+use jsonwebtoken::EncodingKey;
 use reqwest::Client;
 use ring::{rand::SystemRandom, signature::EcdsaKeyPair};
 
 use super::{listener::ChallengeTypeParameters, ACME_KEY_ALG};
 use crate::listener::acme::{
-    jose,
+    jose::{self, header},
     protocol::{
         CsrRequest, Directory, FetchAuthorizationResponse, Identifier, NewOrderRequest,
         NewOrderResponse,
@@ -67,12 +67,7 @@ impl AcmeClient {
             &self.client,
             &self.directory.new_order,
             &jsonwebtoken::encode_jws(
-                &Header {
-                    kid: Some(kid.to_string()),
-                    nonce: Some(nonce),
-                    url: Some(self.directory.new_order.clone()),
-                    ..Default::default()
-                },
+                &header(kid, nonce, &self.directory.new_order),
                 Some(&NewOrderRequest {
                     identifiers: domains
                         .iter()
@@ -105,17 +100,8 @@ impl AcmeClient {
         let resp: FetchAuthorizationResponse = jose::request_json(
             &self.client,
             auth_url,
-            &jsonwebtoken::encode_jws(
-                &Header {
-                    kid: Some(kid.to_string()),
-                    nonce: Some(nonce),
-                    url: Some(auth_url.to_string()),
-                    ..Default::default()
-                },
-                None::<&()>,
-                &self.key_pair,
-            )
-            .map_err(|err| {
+            &jsonwebtoken::encode_jws(&header(kid, nonce, auth_url), None::<&()>, &self.key_pair)
+                .map_err(|err| {
                 IoError::new(ErrorKind::Other, format!("failed to encode payload: {err}"))
             })?,
         )
@@ -149,12 +135,7 @@ impl AcmeClient {
             &self.client,
             url,
             &jsonwebtoken::encode_jws(
-                &Header {
-                    kid: Some(kid.to_string()),
-                    nonce: Some(nonce),
-                    url: Some(url.to_string()),
-                    ..Default::default()
-                },
+                &header(kid, nonce, url),
                 Some(&serde_json::json!({})),
                 &self.key_pair,
             )
@@ -180,12 +161,7 @@ impl AcmeClient {
             &self.client,
             url,
             &jsonwebtoken::encode_jws(
-                &Header {
-                    kid: Some(kid.to_string()),
-                    nonce: Some(nonce),
-                    url: Some(url.to_string()),
-                    ..Default::default()
-                },
+                &header(kid, nonce, url),
                 Some(&CsrRequest {
                     csr: URL_SAFE_NO_PAD.encode(csr),
                 }),
@@ -205,19 +181,10 @@ impl AcmeClient {
         let resp = jose::request(
             &self.client,
             url,
-            &jsonwebtoken::encode_jws(
-                &Header {
-                    kid: Some(kid.to_string()),
-                    nonce: Some(nonce),
-                    url: Some(url.to_string()),
-                    ..Default::default()
-                },
-                None::<&()>,
-                &self.key_pair,
-            )
-            .map_err(|err| {
-                IoError::new(ErrorKind::Other, format!("failed to encode payload: {err}"))
-            })?,
+            &jsonwebtoken::encode_jws(&header(kid, nonce, url), None::<&()>, &self.key_pair)
+                .map_err(|err| {
+                    IoError::new(ErrorKind::Other, format!("failed to encode payload: {err}"))
+                })?,
         )
         .await?;
 
