@@ -1,11 +1,11 @@
 use chrono::{DateTime, NaiveDateTime, Utc};
 use jsonwebtoken::{jwk::Jwk, jws::Jws, Header};
-use reqwest::{header::HeaderMap, Client, Response};
+use reqwest::{Client, Response};
 use ring::digest::{digest, Digest, SHA256};
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::str::FromStr;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 pub(crate) fn header(kid: &str, nonce: String, url: &str) -> Header {
     Header {
