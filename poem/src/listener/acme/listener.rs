@@ -12,6 +12,7 @@ use crate::{
     web::{LocalAddr, RemoteAddr},
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chrono::Utc;
 use http::uri::Scheme;
 use jsonwebtoken::{jwk::Jwk, EncodingKey, Header};
 use rcgen::{
@@ -477,8 +478,8 @@ pub async fn issue_cert<T: AsRef<str>>(
         )
     })?;
 
-    let order_resp = client
-        .send_csr(&order_resp.finalize, kid, &csr)
+    let mut order_resp = client
+        .send_finalize(&order_resp.finalize, kid, &csr)
         .await
         .map_err(|err| {
             IoError::new(
@@ -486,27 +487,65 @@ pub async fn issue_cert<T: AsRef<str>>(
                 format!("error sending csr to issuer: {err}"),
             )
         })?;
+    let mut done = false;
+    for _ in 1..5 {
+        if order_resp.data.status == "invalid" {
+            return Err(IoError::new(
+                ErrorKind::Other,
+                format!(
+                    "failed to request certificate: {}",
+                    order_resp
+                        .data
+                        .error
+                        .as_ref()
+                        .map(|problem| &*problem.detail)
+                        .unwrap_or("unknown")
+                ),
+            ));
+        }
 
-    if order_resp.status == "invalid" {
-        return Err(IoError::new(
-            ErrorKind::Other,
-            format!(
-                "failed to request certificate: {}",
-                order_resp
-                    .error
-                    .as_ref()
-                    .map(|problem| &*problem.detail)
-                    .unwrap_or("unknown")
-            ),
-        ));
+        if order_resp.data.status == "valid" {
+            done = true;
+            break;
+        }
+
+        match order_resp
+            .retry_after
+            .unwrap_or(jose::RetryAfter::Relative(Duration::from_secs(10)))
+        {
+            jose::RetryAfter::Relative(d) => tokio::time::sleep(d).await,
+            jose::RetryAfter::Absolute(t) => {
+                tokio::time::sleep(
+                    t.signed_duration_since(Utc::now())
+                        .to_std()
+                        .unwrap_or(Duration::from_secs(10)),
+                )
+                .await
+            }
+        }
+
+        let location = match order_resp.location {
+            Some(l) => l,
+            None => {
+                return Err(IoError::new(
+                    ErrorKind::Other,
+                    "response is missing location header",
+                ));
+            }
+        };
+        order_resp = client.get_order(&location, kid).await.map_err(|err| {
+            IoError::new(
+                ErrorKind::Other,
+                format!("error checking finalize status: {err}"),
+            )
+        })?;
     }
-
-    if order_resp.status != "valid" {
+    if !done {
         return Err(IoError::new(
             ErrorKind::Other,
             format!(
                 "failed to request certificate: unexpected status `{}`",
-                order_resp.status
+                order_resp.data.status
             ),
         ));
     }
@@ -515,6 +554,7 @@ pub async fn issue_cert<T: AsRef<str>>(
     let acme_cert_pem = client
         .obtain_certificate(
             order_resp
+                .data
                 .certificate
                 .as_ref()
                 .ok_or_else(|| {

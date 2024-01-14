@@ -26,7 +26,7 @@ pub(crate) struct Directory {
     pub(crate) new_order: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NewAccountRequest {
     pub(crate) only_return_existing: bool,
@@ -44,7 +44,7 @@ pub(crate) struct Identifier {
     pub(crate) value: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NewOrderRequest {
     pub(crate) identifiers: Vec<Identifier>,

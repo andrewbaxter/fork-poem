@@ -2,10 +2,10 @@ use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use jsonwebtoken::EncodingKey;
-use reqwest::Client;
+use reqwest::{Client, ClientBuilder};
 use ring::{rand::SystemRandom, signature::EcdsaKeyPair};
 
-use super::{listener::ChallengeTypeParameters, ACME_KEY_ALG};
+use super::{jose::ResponseData, listener::ChallengeTypeParameters, ACME_KEY_ALG};
 use crate::listener::acme::{
     jose::{self, header},
     protocol::{
@@ -46,7 +46,11 @@ impl AcmeClient {
         contacts: Vec<String>,
         key: EncodingKey,
     ) -> IoResult<Self> {
-        let client = Client::new();
+        let client = ClientBuilder::new()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        // let client = Client::new();
         let directory = get_directory(&client, directory_url).await?;
         Ok(Self {
             client,
@@ -63,7 +67,7 @@ impl AcmeClient {
         tracing::debug!(kid = kid, "new order request");
 
         let nonce = get_nonce(&self.client, &self.directory).await?;
-        let resp: NewOrderResponse = jose::request_json(
+        let resp = jose::request_json::<_, NewOrderResponse>(
             &self.client,
             &self.directory.new_order,
             &jsonwebtoken::encode_jws(
@@ -85,8 +89,8 @@ impl AcmeClient {
         )
         .await?;
 
-        tracing::debug!(status = resp.status.as_str(), "order created");
-        Ok(resp)
+        tracing::debug!(status = resp.data.status.as_str(), "order created");
+        Ok(resp.data)
     }
 
     pub(crate) async fn fetch_authorization(
@@ -97,7 +101,7 @@ impl AcmeClient {
         tracing::debug!(auth_uri = %auth_url, "fetch authorization");
 
         let nonce = get_nonce(&self.client, &self.directory).await?;
-        let resp: FetchAuthorizationResponse = jose::request_json(
+        let resp = jose::request_json::<_, FetchAuthorizationResponse>(
             &self.client,
             auth_url,
             &jsonwebtoken::encode_jws(&header(kid, nonce, auth_url), None::<&()>, &self.key_pair)
@@ -108,12 +112,12 @@ impl AcmeClient {
         .await?;
 
         tracing::debug!(
-            identifier = ?resp.identifier,
-            status = resp.status.as_str(),
+            identifier = ?resp.data.identifier,
+            status = resp.data.status.as_str(),
             "authorization response",
         );
 
-        Ok(resp)
+        Ok(resp.data)
     }
 
     pub(crate) async fn trigger_challenge(
@@ -148,16 +152,16 @@ impl AcmeClient {
         Ok(())
     }
 
-    pub(crate) async fn send_csr(
+    pub(crate) async fn send_finalize(
         &self,
         url: &str,
         kid: &str,
         csr: &[u8],
-    ) -> IoResult<NewOrderResponse> {
+    ) -> IoResult<ResponseData<NewOrderResponse>> {
         tracing::debug!(url = %url, "send certificate request");
 
         let nonce = get_nonce(&self.client, &self.directory).await?;
-        jose::request_json(
+        jose::request_json::<_, NewOrderResponse>(
             &self.client,
             url,
             &jsonwebtoken::encode_jws(
@@ -170,6 +174,25 @@ impl AcmeClient {
             .map_err(|err| {
                 IoError::new(ErrorKind::Other, format!("failed to encode payload: {err}"))
             })?,
+        )
+        .await
+    }
+
+    pub(crate) async fn get_order(
+        &self,
+        url: &str,
+        kid: &str,
+    ) -> IoResult<ResponseData<NewOrderResponse>> {
+        tracing::debug!(url = %url, "get order request");
+
+        let nonce = get_nonce(&self.client, &self.directory).await?;
+        jose::request_json::<_, NewOrderResponse>(
+            &self.client,
+            url,
+            &jsonwebtoken::encode_jws(&header(kid, nonce, url), None::<&()>, &self.key_pair)
+                .map_err(|err| {
+                    IoError::new(ErrorKind::Other, format!("failed to encode payload: {err}"))
+                })?,
         )
         .await
     }
